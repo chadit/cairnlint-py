@@ -29,6 +29,9 @@ ANALYZER = "agentpassthrough"
 # is neither a forwarder nor a method that does other work.
 _CONSTRUCTORS = frozenset({"__init__", "__new__", "__post_init__"})
 
+# Receivers a call can start from that are values the method writes out itself.
+_LITERALS = (ast.Constant, ast.JoinedStr, ast.List, ast.Tuple, ast.Set, ast.Dict)
+
 
 def check(sources: Sequence[SourceFile]) -> list[Finding]:
     """Report forward-only methods and wrapper classes in non-test files."""
@@ -106,9 +109,48 @@ def _find_forward_target(method: FunctionNode, owner: ast.ClassDef) -> str | Non
     call = _find_sole_call(body[0]) if len(body) == 1 else None
     if call is None or not isinstance(call.func, ast.Attribute):
         return None
-    if not _passes_every_param(method, owner, call):
+    if _has_literal_receiver(call.func) or not _passes_every_param(method, owner, call):
+        return None
+    if _declares_default_on_super_forward(method, call.func):
         return None
     return _spell(call.func)
+
+
+def _has_literal_receiver(target: ast.Attribute) -> bool:
+    """Whether the call works on a literal, such as `",".join(parts)`.
+
+    A method on a value the body writes out itself hands nothing to another
+    object, so it is real work rather than a forward.
+    """
+    receiver = target.value
+    while isinstance(receiver, ast.Attribute | ast.Subscript | ast.Call):
+        receiver = receiver.func if isinstance(receiver, ast.Call) else receiver.value
+    return isinstance(receiver, _LITERALS)
+
+
+def _declares_default_on_super_forward(
+    method: FunctionNode, target: ast.Attribute
+) -> bool:
+    """Whether a super() forward declares a default on any of its parameters.
+
+    A default the override declares may differ from its parent's, and changing
+    it is a choice the override makes rather than a forward. Telling would
+    mean resolving the parent, so any declared default skips the method, and
+    an override that repeats its parent's default is a known miss.
+    """
+    arguments = method.args
+    has_default = bool(arguments.defaults) or any(
+        default is not None for default in arguments.kw_defaults
+    )
+    return has_default and _is_super_call(target.value)
+
+
+def _is_super_call(node: ast.expr) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "super"
+    )
 
 
 def _find_sole_call(statement: ast.stmt) -> ast.Call | None:

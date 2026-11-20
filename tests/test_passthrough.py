@@ -89,6 +89,32 @@ def _format_forwards_finding(position: str, method: str, target: str) -> str:
         ),
         pytest.param(
             """
+            class Child(Base):
+                async def load(self, key):
+                    return await super().load(key)
+            """,
+            [_format_forwards_finding("mod.py:3:15", "Child.load", "super().load")],
+            id="async-super-forward-without-a-default",
+        ),
+        pytest.param(
+            """
+            class Store:
+                def __init__(self, inner, other):
+                    self._inner = inner
+                    self._other = other
+
+                def render(self, page="home"):
+                    return self._inner.render(page)
+            """,
+            [
+                _format_forwards_finding(
+                    "mod.py:7:9", "Store.render", "self._inner.render"
+                )
+            ],
+            id="field-forward-declaring-a-default",
+        ),
+        pytest.param(
+            """
             from typing import ClassVar
 
             class Wrapper:
@@ -126,6 +152,27 @@ def _format_forwards_finding(position: str, method: str, target: str) -> str:
                 _format_forwards_finding("mod.py:11:9", "Paths.now", "self.clock.now"),
             ],
             id="forward-that-skips-the-field",
+        ),
+        pytest.param(
+            """
+            class Inner:
+                def join(self, parts):
+                    return ",".join(parts)
+
+
+            class Wrapper:
+                def __init__(self, inner):
+                    self._inner = inner
+
+                def join(self, parts):
+                    return self._inner.join(parts)
+            """,
+            [
+                "mod.py:7:7: [agent] class Wrapper wraps one field and every one "
+                + "of its 1 methods forwards; callers can hold the wrapped value "
+                + "directly"
+            ],
+            id="wrapper-around-a-class-that-joins-on-a-literal",
         ),
     ],
 )
@@ -197,6 +244,52 @@ def test_forwarding_is_reported(lint: Lint, source: str, expected: list[str]) ->
                     return self._inner.join(_)
             """,
             id="blank-parameter",
+        ),
+        pytest.param(
+            """
+            class Joiner:
+                def join(self, parts):
+                    return ",".join(parts)
+
+                def fill(self, items):
+                    return [].extend(items)
+            """,
+            id="method-on-a-literal-receiver",
+        ),
+        pytest.param(
+            """
+            class Joiner:
+                def first(self, parts):
+                    return ",;"[0].join(parts)
+
+                def trimmed(self, parts):
+                    return ", ".strip().join(parts)
+            """,
+            id="method-on-an-indexed-or-called-literal",
+        ),
+        pytest.param(
+            """
+            class Base:
+                def render(self, page="home"):
+                    return page
+
+
+            class Child(Base):
+                def render(self, page="home"):
+                    return super().render(page)
+            """,
+            id="super-forward-repeating-the-parent-default",
+        ),
+        pytest.param(
+            """
+            from views import Base
+
+
+            class Child(Base):
+                def render(self, page, *, strict=True):
+                    return super().render(page, strict=strict)
+            """,
+            id="super-forward-declaring-a-keyword-only-default",
         ),
         pytest.param(
             """
