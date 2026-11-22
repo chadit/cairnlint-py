@@ -341,3 +341,328 @@ def test_test_files_are_skipped(lint: Lint) -> None:
     """
     run = lint({"test_spy.py": source})
     assert run.findings == []
+
+
+BROKER = """
+from typing import Protocol
+
+
+class Broker(Protocol):
+    def publish(self, topic: str, payload: bytes) -> None: ...
+
+    def subscribe(self, topic: str) -> None: ...
+
+    def close(self) -> None: ...
+"""
+
+KAFKA = """
+class KafkaBroker:
+    def __init__(self, producer, consumer):
+        self.producer = producer
+        self.consumer = consumer
+
+    def publish(self, topic, payload):
+        self.producer.send(topic, payload)
+        self.producer.flush()
+
+    def subscribe(self, topic):
+        self.consumer.subscribe([topic])
+
+    def close(self):
+        return self.producer.stop()
+"""
+
+NATS = """
+class NatsBroker:
+    def __init__(self, client):
+        self.client = client
+        self.subjects = []
+
+    def publish(self, topic, payload):
+        self.client.publish(topic, payload)
+        self.subjects.append(topic)
+
+    def subscribe(self, topic):
+        self.subjects.append(topic)
+
+    def close(self):
+        return self.client.drain()
+"""
+
+
+ABC_BASE = """
+from abc import ABC, abstractmethod
+
+
+class Base(ABC):
+    @abstractmethod
+    def close(self) -> None: ...
+
+    def flush(self):
+        return None
+"""
+
+ABC_KAFKA = """
+from abc_base import Base
+
+
+class Kafka(Base):
+    def __init__(self, producer, other):
+        self.producer = producer
+        self.other = other
+
+    def close(self):
+        return self.producer.stop()
+"""
+
+DIAMOND_BASE = """
+from abc import ABC, abstractmethod
+
+
+class Base(ABC):
+    @abstractmethod
+    def a(self): ...
+
+
+class Left(Base):
+    @abstractmethod
+    def l(self): ...
+
+
+class Right(Base):
+    @abstractmethod
+    def r(self): ...
+"""
+
+DIAMOND_IMPL = """
+from base import Left, Right
+
+
+class Leaf(Left, Right):
+    def __init__(self, inner, other):
+        self.inner = inner
+        self.other = other
+
+    def a(self):
+        return self.inner.a()
+
+    def l(self):
+        return self.inner.l()
+
+    def r(self):
+        return self.inner.r()
+
+
+class Sub(Leaf):
+    def l(self):
+        return self.inner.l2()
+
+    def r(self):
+        return self.inner.r2()
+"""
+
+ABC_MID = """
+from abc import abstractmethod
+
+from abc_base import Base
+
+
+class Mid(Base):
+    @abstractmethod
+    def send(self, message) -> None: ...
+
+    def ping(self):
+        return None
+"""
+
+ABC_MID_KAFKA = (
+    ABC_KAFKA.replace("abc_base import Base", "mid import Mid").replace(
+        "Kafka(Base)", "Kafka(Mid)"
+    )
+    + "\n    def send(self, message):\n        return self.producer.send(message)\n"
+)
+
+ABC_NATS = """
+from abc_base import Base
+
+
+class Nats(Base):
+    def close(self):
+        self.closed = True
+"""
+
+ABC_MID_NATS = (
+    ABC_NATS.replace("abc_base import Base", "mid import Mid").replace(
+        "Nats(Base)", "Nats(Mid)"
+    )
+    + "\n    def send(self, message):\n        self.sent = message\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("files", "expected"),
+    [
+        pytest.param(
+            {"broker.py": BROKER, "kafka.py": KAFKA, "nats.py": NATS},
+            [],
+            id="classes-that-satisfy-a-protocol-in-another-file",
+        ),
+        pytest.param(
+            {
+                "broker.py": BROKER,
+                "adapter.py": "from broker import Broker\n\n\n"
+                + "class Adapter(Broker):\n    def __init__(self, inner):\n"
+                + "        self.inner = inner\n\n    def close(self):\n"
+                + "        return self.inner.stop()\n",
+                "kafka.py": KAFKA,
+            },
+            [],
+            id="class-that-names-the-protocol-as-a-base",
+        ),
+        pytest.param(
+            {
+                "broker.py": BROKER,
+                "partial.py": "\nclass PartialBroker:\n"
+                + "    def __init__(self, producer):\n"
+                + "        self.producer = producer\n\n"
+                + "    def publish(self, topic, payload):\n"
+                + "        self.producer.send(topic, payload)\n"
+                + "        self.producer.flush()\n\n"
+                + "    def close(self):\n        return self.producer.stop()\n",
+                "kafka.py": KAFKA,
+                "nats.py": NATS,
+            },
+            [
+                _format_forwards_finding(
+                    "partial.py:10:9", "PartialBroker.close", "self.producer.stop"
+                )
+            ],
+            id="class-that-defines-only-some-protocol-methods",
+        ),
+        pytest.param(
+            {
+                "broker.py": BROKER,
+                "kafka.py": KAFKA
+                + "\n    def flush(self):\n        return self.producer.flush()\n",
+                "nats.py": NATS,
+            },
+            [
+                _format_forwards_finding(
+                    "kafka.py:17:9", "KafkaBroker.flush", "self.producer.flush"
+                )
+            ],
+            id="forward-whose-name-no-protocol-declares",
+        ),
+        pytest.param(
+            {
+                "impl.py": "class Kafka:\n    def __init__(self, producer, other):\n"
+                + "        self.producer = producer\n        self.other = other\n\n"
+                + "    def close(self):\n        return self.producer.stop()\n",
+                "tests/test_kafka.py": "from typing import Protocol\n\n\n"
+                + "class Closer(Protocol):\n    def close(self) -> None: ...\n",
+            },
+            [
+                _format_forwards_finding(
+                    "impl.py:6:9", "Kafka.close", "self.producer.stop"
+                )
+            ],
+            id="protocol-declared-only-in-test-code",
+        ),
+        pytest.param(
+            {"abc_base.py": ABC_BASE, "kafka.py": ABC_KAFKA, "nats.py": ABC_NATS},
+            [],
+            id="subclass-forwarding-an-abstract-method",
+        ),
+        pytest.param(
+            {
+                "abc_base.py": ABC_BASE,
+                "mid.py": "from abc_base import Base\n\n\nclass Mid(Base):\n"
+                + "    pass\n",
+                "kafka.py": ABC_KAFKA.replace(
+                    "abc_base import Base", "mid import Mid"
+                ).replace("Kafka(Base)", "Kafka(Mid)"),
+            },
+            [],
+            id="abstract-method-reached-through-an-intermediate-base",
+        ),
+        pytest.param(
+            {
+                "abc_base.py": ABC_BASE,
+                "mid.py": ABC_MID,
+                "kafka.py": ABC_MID_KAFKA,
+                "nats.py": ABC_MID_NATS,
+            },
+            [],
+            id="abstract-method-an-intermediate-base-adds",
+        ),
+        pytest.param(
+            {
+                "abc_base.py": ABC_BASE,
+                "mid.py": ABC_MID,
+                "kafka.py": ABC_MID_KAFKA
+                + "\n    def ping(self):\n        return self.producer.ping()\n",
+                "nats.py": ABC_MID_NATS,
+            },
+            [
+                _format_forwards_finding(
+                    "kafka.py:16:9", "Kafka.ping", "self.producer.ping"
+                )
+            ],
+            id="override-of-a-concrete-intermediate-method",
+        ),
+        pytest.param(
+            {"base.py": DIAMOND_BASE, "impl.py": DIAMOND_IMPL},
+            [],
+            id="abstract-methods-of-both-branches-of-a-diamond",
+        ),
+        pytest.param(
+            {
+                "abc_base.py": ABC_BASE,
+                "kafka.py": ABC_KAFKA
+                + "\n    def flush(self):\n        return self.producer.flush()\n",
+                "nats.py": ABC_NATS,
+            },
+            [
+                _format_forwards_finding(
+                    "kafka.py:13:9", "Kafka.flush", "self.producer.flush"
+                )
+            ],
+            id="override-of-a-concrete-base-method",
+        ),
+        pytest.param(
+            {
+                "abc_base.py": ABC_BASE,
+                "kafka.py": ABC_KAFKA
+                + "\n    def drain(self):\n        return self.producer.drain()\n",
+                "nats.py": ABC_NATS,
+            },
+            [
+                _format_forwards_finding(
+                    "kafka.py:13:9", "Kafka.drain", "self.producer.drain"
+                )
+            ],
+            id="forward-whose-name-the-base-does-not-declare",
+        ),
+        pytest.param(
+            {
+                "tests/test_base.py": ABC_BASE,
+                "impl.py": "class Kafka(Base):\n"
+                + "    def __init__(self, producer, other):\n"
+                + "        self.producer = producer\n        self.other = other\n\n"
+                + "    def close(self):\n        return self.producer.stop()\n",
+            },
+            [
+                _format_forwards_finding(
+                    "impl.py:6:9", "Kafka.close", "self.producer.stop"
+                )
+            ],
+            id="abstract-base-declared-only-in-test-code",
+        ),
+    ],
+)
+def test_interface_required_method_is_not_a_forward(
+    lint: Lint, files: dict[str, str], expected: list[str]
+) -> None:
+    """A method a Protocol or abstract base needs stays, so it is not a forward."""
+    run = lint(files)
+    assert run.findings == expected

@@ -9,6 +9,7 @@ import ast
 from collections import Counter
 from collections.abc import Sequence
 
+from cairnlint_py.loneimpl import collect_required_members
 from cairnlint_py.source import Finding, SourceFile
 from cairnlint_py.syntax import (
     FunctionNode,
@@ -36,13 +37,17 @@ _LITERALS = (ast.Constant, ast.JoinedStr, ast.List, ast.Tuple, ast.Set, ast.Dict
 def check(sources: Sequence[SourceFile]) -> list[Finding]:
     """Report forward-only methods and wrapper classes in non-test files."""
     findings: list[Finding] = []
+    required = collect_required_members(sources)
     for source, node in iter_nodes(sources, ast.ClassDef):
         if not source.is_test:
-            findings.extend(_check_class(source, node))
+            names = required.get(id(node), frozenset())
+            findings.extend(_check_class(source, node, names))
     return findings
 
 
-def _check_class(source: SourceFile, owner: ast.ClassDef) -> list[Finding]:
+def _check_class(
+    source: SourceFile, owner: ast.ClassDef, required: frozenset[str]
+) -> list[Finding]:
     if is_protocol_class(owner):
         return []
     methods = [
@@ -54,7 +59,8 @@ def _check_class(source: SourceFile, owner: ast.ClassDef) -> list[Finding]:
     forwards = [
         (method, target)
         for method in methods
-        if (target := _find_forward_target(method, owner)) is not None
+        if method.name not in required
+        and (target := _find_forward_target(method, owner)) is not None
     ]
     if not forwards:
         return []

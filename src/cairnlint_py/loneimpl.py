@@ -21,7 +21,7 @@ from cairnlint_py.syntax import (
     iter_nodes,
 )
 
-__all__ = ["ANALYZER", "check"]
+__all__ = ["ANALYZER", "check", "collect_required_members"]
 
 ANALYZER = "agentloneimpl"
 
@@ -43,6 +43,74 @@ class _ClassDecl:
 
 def check(sources: Sequence[SourceFile]) -> list[Finding]:
     """Report Protocols and ABCs with one implementing class in sources."""
+    classes = _describe_classes(sources)
+    registered = _collect_registered_names(sources)
+    findings: list[Finding] = []
+    for interface in classes:
+        kind = _classify_interface(interface)
+        # A Protocol or ABC in test code is scaffolding for the test, such as
+        # a type for a module it loads by path, not an abstraction the
+        # production code carries.
+        if kind is None or interface.source.is_test:
+            continue
+        implementers = _find_implementers(interface, kind, classes, registered)
+        if len(implementers) == 1:
+            findings.append(_build_finding(interface, kind, implementers[0]))
+    return findings
+
+
+def collect_required_members(
+    sources: Sequence[SourceFile],
+) -> dict[int, frozenset[str]]:
+    """The member names each class must keep because an interface requires them.
+
+    Keyed by id() of the class node, so another check walking the same parsed
+    sources can look a class up. Implementers are counted the way this check
+    counts them. A protocol requires every member it declares; an abstract
+    base class requires its abstract methods, of concrete subclasses reached
+    through intermediate bases too, along with any abstract methods those
+    intermediates add. An interface declared in test code is test
+    scaffolding, as `check` treats it, so it requires nothing.
+    """
+    classes = _describe_classes(sources)
+    registered = _collect_registered_names(sources)
+    required: dict[int, frozenset[str]] = {}
+    for interface in classes:
+        kind = _classify_interface(interface)
+        if kind is None or interface.source.is_test:
+            continue
+        for implementer, names in _list_required_members(
+            interface, kind, classes, registered
+        ):
+            key = id(implementer.node)
+            required[key] = required.get(key, frozenset()) | names
+    return required
+
+
+def _list_required_members(
+    interface: _ClassDecl,
+    kind: str,
+    classes: Sequence[_ClassDecl],
+    registered: dict[str, set[str]],
+) -> list[tuple[_ClassDecl, frozenset[str]]]:
+    """Each class that implements interface, with the names it must keep."""
+    implementers = [
+        item
+        for item in _find_implementers(interface, kind, classes, registered)
+        if isinstance(item, _ClassDecl)
+    ]
+    if kind == "protocol":
+        return [(item, interface.members) for item in implementers]
+    own = _collect_abstract_names(interface.node)
+    descendants = [
+        (item, names)
+        for item, names in _walk_descendants(interface, classes)
+        if not _is_abstract(item)
+    ]
+    return [(item, own) for item in implementers] + descendants
+
+
+def _describe_classes(sources: Sequence[SourceFile]) -> list[_ClassDecl]:
     # Test files are included: a test double is the implementation that most
     # often clears the count, as it does in the Go check.
     classes = [
@@ -58,23 +126,10 @@ def check(sources: Sequence[SourceFile]) -> list[Finding]:
     by_name: dict[str, list[_ClassDecl]] = {}
     for item in classes:
         by_name.setdefault(item.node.name, []).append(item)
-    classes = [
+    return [
         replace(item, all_members=_collect_all_members(item, by_name, frozenset()))
         for item in classes
     ]
-    registered = _collect_registered_names(sources)
-    findings: list[Finding] = []
-    for interface in classes:
-        kind = _classify_interface(interface)
-        # A Protocol or ABC in test code is scaffolding for the test, such as
-        # a type for a module it loads by path, not an abstraction the
-        # production code carries.
-        if kind is None or interface.source.is_test:
-            continue
-        implementers = _find_implementers(interface, kind, classes, registered)
-        if len(implementers) == 1:
-            findings.append(_build_finding(interface, kind, implementers[0]))
-    return findings
 
 
 def _collect_members(node: ast.ClassDef) -> frozenset[str]:
@@ -110,10 +165,15 @@ def _read_target_name(target: ast.expr) -> str | None:
 
 
 def _declares_abstract(node: ast.ClassDef) -> bool:
-    return any(
-        not ABSTRACT_DECORATORS.isdisjoint(collect_decorator_names(statement))
+    return bool(_collect_abstract_names(node))
+
+
+def _collect_abstract_names(node: ast.ClassDef) -> frozenset[str]:
+    return frozenset(
+        statement.name
         for statement in node.body
         if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef)
+        and not ABSTRACT_DECORATORS.isdisjoint(collect_decorator_names(statement))
     )
 
 
@@ -198,17 +258,38 @@ def _find_concrete_subclasses(
     interface: _ClassDecl, classes: Sequence[_ClassDecl]
 ) -> list[_ClassDecl]:
     """Concrete descendants by base name, walking through abstract ones."""
-    pending = [interface.node.name]
-    seen = set(pending)
-    concrete_subclasses: list[_ClassDecl] = []
+    return [
+        item
+        for item, _ in _walk_descendants(interface, classes)
+        if not _is_abstract(item)
+    ]
+
+
+def _walk_descendants(
+    interface: _ClassDecl, classes: Sequence[_ClassDecl]
+) -> list[tuple[_ClassDecl, frozenset[str]]]:
+    """Every descendant by base name, with the abstract names gathered on its way.
+
+    A concrete class must define every abstract method of the classes between
+    it and the base, so each class passed through adds its own to the names
+    its descendants inherit. A class below a diamond is reached once per
+    branch, so a name is walked again whenever it arrives with names it did
+    not have yet. Names only grow, so a cycle of base names stops.
+    """
+    pending = [(interface.node.name, _collect_abstract_names(interface.node))]
+    reached: dict[str, frozenset[str]] = {}
+    descendants: dict[tuple[str, int], tuple[_ClassDecl, frozenset[str]]] = {}
     while pending:
-        parent = pending.pop()
-        children = [item for item in classes if parent in item.bases]
-        concrete_subclasses.extend(item for item in children if not _is_abstract(item))
-        new_names = {item.node.name for item in children} - seen
-        seen |= new_names
-        pending.extend(new_names)
-    return concrete_subclasses
+        parent, arrived = pending.pop()
+        if parent in reached and arrived <= reached[parent]:
+            continue
+        inherited = reached[parent] = reached.get(parent, frozenset()) | arrived
+        for item in (child for child in classes if parent in child.bases):
+            names = inherited | _collect_abstract_names(item.node)
+            _, earlier = descendants.get(item.key, (item, frozenset()))
+            descendants[item.key] = (item, earlier | names)
+            pending.append((item.node.name, names))
+    return list(descendants.values())
 
 
 def _find_structural_matches(
