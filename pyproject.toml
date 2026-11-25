@@ -22,6 +22,10 @@ dev = [
     "ruff==0.17.6",
 ]
 
+[tool.uv]
+# make update-deps writes this from MIN_AGE_DAYS in the Makefile.
+exclude-newer = "3 days"
+
 [tool.ruff]
 target-version = "py312"
 line-length = 88
@@ -60,3 +64,8 @@ files = ["src", "tests"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--strict-markers"
+# A testdata/eval/ with no case directories must fail the eval, not skip it.
+empty_parameter_set_mark = "fail_at_collect"
+# Remove every tmp_path and tmp_path_factory folder when the session ends,
+# failed tests included, the way Go's t.TempDir() cleans up.
+tmp_path_retention_policy = "none"

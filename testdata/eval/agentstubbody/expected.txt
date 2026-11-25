@@ -1,0 +1,2 @@
+flag.py:1:5: [agent] function load_user is a stub ("NotImplementedError"): wire up a real implementation before use
+flag.py:5:5: [agent] function flush has an empty body but its docstring describes behavior: implement it or drop the claim

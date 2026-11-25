@@ -1,16 +1,23 @@
 """The cairnlint-py command: agent-mode detection, the checks, and their output.
 
 Output follows cairnlint's agent mode so a caller that handles one handles
-both. Findings go to `cairnlint-agent-<PID>.txt` in the temp directory, one
-`path:line:column: message` line each, and a single stderr line names the
-file. A run with no findings writes no file.
+both. Findings go to `cairnlint-agent-<PID>.txt` in TMPDIR, or the system temp
+directory when TMPDIR is unset, one `path:line:column: message` line each,
+and a single stderr line names the file. A run with no findings writes no
+file, and one whose file cannot be written prints its findings to stderr and
+exits 3. A path or file that cannot be loaded exits 1. Each agent-mode run
+first deletes agent files in that directory last written more than a day ago.
 """
 
 import argparse
+import contextlib
 import logging
 import os
+import re
+import stat
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -57,25 +64,38 @@ _EXIT_FINDINGS_PRINTED = 3
 # The file sits in a shared temp directory, so only its owner may read it.
 _AGENT_FILE_MODE = 0o600
 
+# The names this tool writes, cairnlint-agent-<PID>.txt, and nothing else.
+_AGENT_FILE_NAME = re.compile(r"cairnlint-agent-[0-9]+\.txt")
+# A day leaves any caller time to read its file before a later run sweeps it.
+_AGENT_FILE_MAX_AGE_SECONDS = 24 * 60 * 60
+
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the checks on the given paths and return the exit status."""
     args = _parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname).1s: %(message)s")
+    # Only existence is checked before agent mode, so a mistyped path fails a
+    # human run too. Parsing waits for agent mode, so a human run passes over
+    # a file that does not parse or a directory it cannot read.
+    missing = [path for path in args.paths if not path.exists()]
+    for path in missing:
+        logger.error("path does not exist: path=%s", path)
+    existing = [path for path in args.paths if path not in missing]
     if not (args.agent or any(os.environ.get(key) for key in AGENT_ENV_VARS)):
         # Every check is agent-tier, so outside agent mode there is nothing to
         # run, the way cairnlint skips its agent tier for a human.
         logger.info(
             "agent mode is off, so no checks ran: pass --agent or set CAIRNLINT_AGENT=1"
         )
-        return 0
-    sources, load_failed = load_sources(args.paths)
+        return _EXIT_LOAD_FAILED if missing else 0
+    _sweep_old_agent_files()
+    sources, load_failed = load_sources(existing)
     unfiltered_findings = [
         finding for check in _CHECKS.values() for finding in check(sources)
     ]
     findings = sorted(filter_suppressed(unfiltered_findings, sources))
     status = _write_findings(findings) if findings else 0
-    return _EXIT_LOAD_FAILED if load_failed else status
+    return _EXIT_LOAD_FAILED if load_failed or missing else status
 
 
 class _Arguments(argparse.Namespace):
@@ -109,14 +129,56 @@ def _parse_args(argv: Sequence[str] | None) -> _Arguments:
         "paths",
         nargs="+",
         type=Path,
-        help="Python files or directories to check, searched recursively",
+        help=(
+            "files to check, each a .py file or a script whose #! line runs "
+            "python or uv, or directories searched recursively for .py files "
+            "outside hidden, cache, virtual environment, and testdata directories"
+        ),
     )
     return parser.parse_args(argv, namespace=_Arguments())
 
 
+def _find_agent_dir() -> Path:
+    # TMPDIR is used as given, as Go's os.TempDir does. tempfile.gettempdir()
+    # moves on to another directory when TMPDIR is missing or unwritable, and
+    # a caller reading $TMPDIR/cairnlint-agent-*.txt would then see no file.
+    return Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+
+
+def _sweep_old_agent_files() -> None:
+    """Delete agent files in the agent directory last written more than a day ago.
+
+    A caller reads its file after the run ends, so no run can delete its own;
+    each one clears what earlier runs left. Anything it cannot find, list,
+    read, or remove, such as another user's file in a shared /tmp or a
+    sandbox with no writable temp directory, is skipped without a word,
+    because that is the normal case and never this run's problem.
+    """
+    cutoff = time.time() - _AGENT_FILE_MAX_AGE_SECONDS
+    try:
+        # gettempdir() raises FileNotFoundError when no candidate is writable.
+        entries = list(os.scandir(_find_agent_dir()))
+    except OSError:
+        return
+    for entry in entries:
+        if _is_old_agent_file(entry, cutoff):
+            with contextlib.suppress(OSError):
+                Path(entry.path).unlink()
+
+
+def _is_old_agent_file(entry: os.DirEntry[str], cutoff: float) -> bool:
+    if _AGENT_FILE_NAME.fullmatch(entry.name) is None:
+        return False
+    try:
+        info = entry.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_mtime < cutoff
+
+
 def _write_findings(findings: Sequence[Finding]) -> int:
     lines = [finding.render() for finding in findings]
-    path = Path(tempfile.gettempdir()) / f"cairnlint-agent-{os.getpid()}.txt"
+    path = _find_agent_dir() / f"cairnlint-agent-{os.getpid()}.txt"
     try:
         _write_agent_file(path, lines)
     except OSError as err:

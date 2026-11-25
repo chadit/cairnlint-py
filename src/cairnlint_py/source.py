@@ -14,6 +14,10 @@ __all__ = ["Finding", "SourceFile", "load_sources"]
 logger = logging.getLogger(__name__)
 
 _TEST_DIRECTORIES = frozenset({"tests", "test"})
+_SKIPPED_DIRECTORIES = frozenset({"__pycache__", "testdata"})
+# `uv run --script` runs a Python file, so a uv #! line marks one too.
+_SCRIPT_INTERPRETERS = frozenset({"python", "uv"})
+_VERSION_SUFFIX = re.compile(r"[0-9.].*")
 _PROJECT_MARKERS = ("pyproject.toml", ".git")
 _DEFINITION_KEYWORD = re.compile(rb"(?:async\s+)?(?:def|class)\s+")
 
@@ -59,32 +63,55 @@ class SourceFile:
 
 
 def load_sources(roots: Sequence[Path]) -> tuple[list[SourceFile], bool]:
-    """Parse every Python file under roots.
+    """Parse every Python file under roots, each of which must exist.
 
-    Returns the parsed files and whether any root or file failed to load. A
-    failed file is logged and skipped so the rest of the tree is still checked.
+    Returns the parsed files and whether any directory or file failed to load.
+    One that fails is logged and skipped so the rest of the tree is still
+    checked.
     """
     loaded: dict[Path, SourceFile] = {}
+    unreadable: list[OSError] = []
     failed = False
     for root in roots:
-        if not root.exists():
-            logger.error("path does not exist: path=%s", root)
-            failed = True
-            continue
-        parsed = [_parse(path, is_test) for path, is_test in _discover(root)]
+        found = _discover(root, unreadable)
+        parsed = [_parse(path, is_test) for path, is_test in found]
         failed = failed or None in parsed
         loaded.update((source.path, source) for source in parsed if source is not None)
-    return list(loaded.values()), failed
+    for err in unreadable:
+        logger.error(
+            "skipping directory that could not be read: path=%s error_type=%s",
+            _failed_path(err),
+            type(err).__name__,
+        )
+    return list(loaded.values()), failed or bool(unreadable)
 
 
-def _discover(root: Path) -> Iterator[tuple[Path, bool]]:
-    # A file named on the command line is checked whatever its directory, but
-    # a stub file holds declarations only, so there is nothing to check in it.
+def _failed_path(err: OSError) -> str:
+    # The walk sets filename to the str path it tried, but the type admits any.
+    # normpath drops the "./" the walk joins on, matching how files are named.
+    match err:
+        case OSError(filename=str(path)):
+            return os.path.normpath(path)
+        case _:
+            return str(err)
+
+
+def _discover(root: Path, unreadable: list[OSError]) -> Iterator[tuple[Path, bool]]:
+    """Yield each file to check under root, with whether it is test code.
+
+    A directory the walk cannot list is appended to unreadable, since
+    Path.walk otherwise drops it without a word.
+    """
+    # A file named on the command line is checked whatever its directory. A
+    # path that is neither, such as a device or a FIFO, is passed over
+    # unopened, since reading a FIFO would block the run.
     if root.is_file():
-        if root.suffix != ".pyi":
+        if _is_python_file(root):
             yield root, _is_test_path(root)
         return
-    for directory, subdirectories, filenames in root.walk():
+    if not root.is_dir():
+        return
+    for directory, subdirectories, filenames in root.walk(on_error=unreadable.append):
         subdirectories[:] = sorted(
             name for name in subdirectories if not _is_skipped(directory / name)
         )
@@ -95,11 +122,46 @@ def _discover(root: Path) -> Iterator[tuple[Path, bool]]:
         )
 
 
+def _is_python_file(path: Path) -> bool:
+    """Whether a file named on the command line holds Python to check.
+
+    These are the files lint.sh's python lane hands over: a .py file, or a
+    file with no extension whose #! line runs python or uv. A .pyi stub holds
+    declarations only, so there is nothing to check in it.
+    """
+    if path.suffix:
+        return path.suffix == ".py"
+    try:
+        with path.open("rb") as handle:
+            first_line = handle.readline()
+    except OSError:
+        # Unknown, so the parse step gets it and reports why it cannot load.
+        return True
+    return _shebang_interpreter(first_line) in _SCRIPT_INTERPRETERS
+
+
+def _shebang_interpreter(first_line: bytes) -> str | None:
+    """The interpreter a #! line runs, read the way lint.sh's shebang_interp does.
+
+    env, its options, and VAR=value settings are passed over, and a version
+    suffix is dropped, so `#!/usr/bin/env -S python3.12 -u` gives `python`.
+    """
+    if not first_line.startswith(b"#!"):
+        return None
+    for word in first_line[2:].decode(errors="replace").split():
+        name = word.rsplit("/", 1)[-1]
+        if name == "env" or name.startswith("-") or "=" in name:
+            continue
+        return _VERSION_SUFFIX.sub("", name)
+    return None
+
+
 def _is_skipped(directory: Path) -> bool:
     # pyvenv.cfg marks a virtual environment whatever the directory is called.
+    # testdata holds fixtures, which the go tool and lint.sh leave out too.
     return (
         directory.name.startswith(".")
-        or directory.name == "__pycache__"
+        or directory.name in _SKIPPED_DIRECTORIES
         or (directory / "pyvenv.cfg").exists()
     )
 

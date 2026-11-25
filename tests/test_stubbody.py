@@ -8,7 +8,7 @@ EMPTY = (
     "has an empty body but its docstring describes behavior: "
     + "implement it or drop the claim"
 )
-STUB = "stub: wire up a real implementation before use"
+STUB = "wire up a real implementation before use"
 UNREAD = (
     "returns without doing the work its signature implies: a one-line function "
     + "that takes inputs but never reads them is usually an unfinished stub"
@@ -20,7 +20,7 @@ CANNED = (
 
 
 def _format_load_user_finding(text: str) -> str:
-    return f'mod.py:2:5: [agent] function load_user is a "{text}" {STUB}'
+    return f'mod.py:2:5: [agent] function load_user is a stub ("{text}"): {STUB}'
 
 
 @pytest.mark.parametrize(
@@ -75,7 +75,8 @@ def _format_load_user_finding(text: str) -> str:
                 def save(self):
                     raise RuntimeError("TODO: implement save")
             """,
-            f'mod.py:3:9: [agent] method save is a "TODO: implement save" {STUB}',
+            'mod.py:3:9: [agent] method save is a stub ("TODO: implement save"): '
+            + STUB,
             id="canned-todo-error",
         ),
         pytest.param(
@@ -83,7 +84,7 @@ def _format_load_user_finding(text: str) -> str:
             def save(key):
                 raise ValueError(f"TODO: persist {key}")
             """,
-            f'mod.py:2:5: [agent] function save is a "TODO: persist " {STUB}',
+            f'mod.py:2:5: [agent] function save is a stub ("TODO: persist "): {STUB}',
             id="canned-todo-f-string",
         ),
         pytest.param(

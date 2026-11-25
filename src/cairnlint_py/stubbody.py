@@ -107,7 +107,7 @@ def _build_sentinel_message(label: str, statement: ast.Raise) -> str | None:
     if text is None:
         return None
     return (
-        f"[agent] {label} is a {json.dumps(text)} stub: "
+        f"[agent] {label} is a stub ({json.dumps(text)}): "
         "wire up a real implementation before use"
     )
 

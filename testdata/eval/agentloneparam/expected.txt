@@ -1,0 +1,1 @@
+flag.py:1:27: [agent] parameter strict of render receives True at all 2 call sites in the analyzed paths; the choice it encodes is never made

@@ -67,13 +67,17 @@ def _check_class(
     # One class-level finding replaces one per method, so a wrapper with eight
     # methods does not produce eight findings that all say the same thing.
     if len(forwards) == len(methods) and _forwards_through_one_field(owner, forwards):
+        which = (
+            "its only method"
+            if len(methods) == 1
+            else f"every one of its {len(methods)} methods"
+        )
         return [
             source.build_finding(
                 owner,
                 ANALYZER,
-                f"[agent] class {owner.name} wraps one field and every one of its "
-                + f"{len(methods)} methods forwards; callers can hold the wrapped "
-                + "value directly",
+                f"[agent] class {owner.name} wraps one field and {which} forwards; "
+                + "callers can hold the wrapped value directly",
             )
         ]
     return [

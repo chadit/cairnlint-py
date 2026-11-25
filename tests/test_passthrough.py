@@ -127,9 +127,8 @@ def _format_forwards_finding(position: str, method: str, target: str) -> str:
                     return self._inner.join(parts)
             """,
             [
-                "mod.py:4:7: [agent] class Wrapper wraps one field and every one "
-                + "of its 1 methods forwards; callers can hold the wrapped value "
-                + "directly"
+                "mod.py:4:7: [agent] class Wrapper wraps one field and its only "
+                + "method forwards; callers can hold the wrapped value directly"
             ],
             id="class-variable-is-not-a-field",
         ),
@@ -168,9 +167,8 @@ def _format_forwards_finding(position: str, method: str, target: str) -> str:
                     return self._inner.join(parts)
             """,
             [
-                "mod.py:7:7: [agent] class Wrapper wraps one field and every one "
-                + "of its 1 methods forwards; callers can hold the wrapped value "
-                + "directly"
+                "mod.py:7:7: [agent] class Wrapper wraps one field and its only "
+                + "method forwards; callers can hold the wrapped value directly"
             ],
             id="wrapper-around-a-class-that-joins-on-a-literal",
         ),

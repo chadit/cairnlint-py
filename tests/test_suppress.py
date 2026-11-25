@@ -5,7 +5,7 @@ import pytest
 from tests.conftest import Lint
 
 STUB = (
-    'mod.py:2:5: [agent] function load is a "NotImplementedError" stub: '
+    'mod.py:2:5: [agent] function load is a stub ("NotImplementedError"): '
     + "wire up a real implementation before use"
 )
 
@@ -43,6 +43,63 @@ def test_non_matching_directive_keeps_the_finding(lint: Lint, directive: str) ->
     source = f"\ndef load(path):  {directive}\n    raise NotImplementedError\n"
     run = lint({"mod.py": source})
     assert run.findings == [STUB]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        pytest.param(
+            """
+            from typing import Protocol
+
+            class Storer(Protocol):  # nolint:agentloneimpl # one store for now
+                def load(self, key: str) -> bytes: ...
+
+            class Sender(Protocol):
+                def send(self, message: str) -> None: ...
+
+            class FileStore:
+                def load(self, key: str) -> bytes:
+                    return key.encode()
+
+            class Mailer:
+                def send(self, message: str) -> None:
+                    print(message)
+            """,
+            "mod.py:7:7: [agent] protocol Sender has exactly one implementing class "
+            + "in the analyzed paths (Mailer) and no test double; using Mailer "
+            + "directly removes the protocol and the indirection at its call sites",
+            id="agentloneimpl",
+        ),
+        pytest.param(
+            """
+            class Store:
+                def __init__(self, inner):
+                    self._inner = inner
+                    self._seen = 0
+
+                def join(self, parts):  # nolint:agentpassthrough
+                    return self._inner.join(parts)
+
+                def split(self, text):
+                    return self._inner.split(text)
+
+                def count(self):
+                    self._seen += 1
+                    return self._seen
+            """,
+            "mod.py:10:9: [agent] method Store.split only forwards its arguments to "
+            + "self._inner.split and adds no behavior of its own",
+            id="agentpassthrough",
+        ),
+    ],
+)
+def test_directive_naming_an_analyzer_suppresses_only_its_target(
+    lint: Lint, source: str, expected: str
+) -> None:
+    """The directive drops its own line's finding; the unmarked twin still reports."""
+    run = lint({"mod.py": source})
+    assert run.findings == [expected]
 
 
 def test_leading_directive_covers_the_whole_statement(lint: Lint) -> None:

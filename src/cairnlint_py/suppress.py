@@ -1,9 +1,9 @@
 """`# nolint` directives, cairnlint's `//nolint` rewritten for Python comments.
 
 A trailing directive suppresses its own line. A directive on a line of its own
-suppresses every line of the statement directly below it, decorators
-included, so one above a `def` or `class`, or between its decorators and the
-`def`, covers the whole body. Names are analyzer names
+suppresses every line of the next statement below it, decorators included and
+blank lines between them allowed, so one above a `def` or `class`, or between
+its decorators and the `def`, covers the whole body. Names are analyzer names
 such as `agentstubbody`, case-insensitive; a bare `# nolint` or `# nolint:all`
 covers every analyzer. The name list ends at the next `#`, which starts the
 explanation, so `# nolint:agentstubbody # reason` works and
