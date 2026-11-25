@@ -178,8 +178,11 @@ def _is_old_agent_file(entry: os.DirEntry[str], cutoff: float) -> bool:
 
 def _write_findings(findings: Sequence[Finding]) -> int:
     lines = [finding.render() for finding in findings]
-    path = _find_agent_dir() / f"cairnlint-agent-{os.getpid()}.txt"
+    # Named in the warning when gettempdir() finds no writable directory and
+    # raises FileNotFoundError, which leaves no file path to report.
+    path: Path | str = "(no usable temp directory)"
     try:
+        path = _find_agent_dir() / f"cairnlint-agent-{os.getpid()}.txt"
         _write_agent_file(path, lines)
     except OSError as err:
         # Losing the findings would be worse than mixing them into stderr.
@@ -197,13 +200,15 @@ def _write_findings(findings: Sequence[Finding]) -> int:
 
 
 def _write_agent_file(path: Path, lines: Sequence[str]) -> None:
-    # Truncating means a file an earlier process with the same PID left behind
-    # does not carry its findings into this run. That file keeps its old mode
-    # through os.open, hence the fchmod, and O_NOFOLLOW refuses a symlink
-    # planted at the path in the shared directory.
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    # Truncating drops findings an earlier process with this PID left, and the
+    # fchmod fixes the mode that file keeps. In the shared directory,
+    # O_NOFOLLOW refuses a planted symlink, O_NONBLOCK keeps a planted FIFO
+    # from hanging the open, and the fstat refuses anything but a regular file.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK
     with os.fdopen(
         os.open(path, flags, _AGENT_FILE_MODE), "w", encoding="utf-8"
     ) as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise OSError(f"not a regular file: {path}")
         os.fchmod(handle.fileno(), _AGENT_FILE_MODE)
         handle.writelines(f"{line}\n" for line in lines)

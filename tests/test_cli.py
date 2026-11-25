@@ -496,6 +496,84 @@ def test_symlink_at_the_agent_path_is_not_followed(lint: Lint, tmp_path: Path) -
     ]
 
 
+# Long enough that a run which refuses the FIFO has finished well before it.
+FIFO_HANG_LIMIT_SECONDS = 5
+
+
+def _blocked_marker(fifo: Path) -> Path:
+    return fifo.with_name("open-was-blocked")
+
+
+def _plant_fifo_with_late_reader(path: Path) -> None:
+    """Make a FIFO at path, and fork a reader that opens it after the limit.
+
+    A writer that blocks opening the FIFO would hang the suite. The late
+    reader frees it instead, and first leaves a marker file when the command
+    is still running at the limit, which is how the test sees a blocking open
+    even though the regular-file check then refuses the FIFO. It runs in the
+    command's own process before the command starts, so pytest itself starts
+    no thread or process.
+    """
+    os.mkfifo(path)
+    command = os.getpid()
+    if os.fork() != 0:
+        return
+    try:
+        # Holding the command's output pipes, or subprocess's exec-status pipe,
+        # would keep the test waiting on this reader even when the run ends.
+        os.closerange(0, os.sysconf("SC_OPEN_MAX"))
+        time.sleep(FIFO_HANG_LIMIT_SECONDS)
+        # An exited command leaves this process to a new parent.
+        if os.getppid() == command:
+            _blocked_marker(path).touch()
+        reader = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        os.set_blocking(reader, True)
+        while os.read(reader, 4096):
+            pass
+    finally:
+        os._exit(0)
+
+
+def _plant_fifo_with_reader_attached(path: Path) -> None:
+    """Make a FIFO at path and hold it open for reading in the command.
+
+    The reader goes on stdin because subprocess closes every other inherited
+    descriptor after this hook runs, and the command never reads stdin.
+    """
+    os.mkfifo(path)
+    _ = os.dup2(os.open(path, os.O_RDONLY | os.O_NONBLOCK), 0)
+
+
+def _fallback_lines(agent_path: Path, root: Path) -> list[str]:
+    return [
+        "W: agent file not written, printing findings instead: "
+        + f"path={agent_path} error_type=OSError",
+        f"{root / 'a.py'}:1:5: [agent] function save {STUB}",
+        f"{root / 'b.py'}:1:5: [agent] function load {STUB}",
+    ]
+
+
+def test_fifo_at_the_agent_path_is_refused_without_blocking(
+    lint: Lint, tmp_path: Path
+) -> None:
+    """A FIFO with no reader is refused at once: findings go to stderr, exit 3."""
+    run = lint(STUBS, expect_exit=3, plant=_plant_fifo_with_late_reader)
+    agent_path = lint.temp_dir / f"cairnlint-agent-{run.pid}.txt"
+    assert not _blocked_marker(agent_path).exists()
+    assert stat.S_ISFIFO(agent_path.lstat().st_mode)
+    assert run.stderr.splitlines() == _fallback_lines(agent_path, tmp_path / "tree")
+
+
+def test_fifo_with_a_reader_at_the_agent_path_is_not_written(
+    lint: Lint, tmp_path: Path
+) -> None:
+    """A FIFO that opens because a reader holds it is still not a file to write."""
+    run = lint(STUBS, expect_exit=3, plant=_plant_fifo_with_reader_attached)
+    agent_path = lint.temp_dir / f"cairnlint-agent-{run.pid}.txt"
+    assert stat.S_ISFIFO(agent_path.lstat().st_mode)
+    assert run.stderr.splitlines() == _fallback_lines(agent_path, tmp_path / "tree")
+
+
 def test_file_named_two_ways_is_checked_once(lint: Lint) -> None:
     """A `..` spelling of a path already given does not repeat its findings."""
     run = lint(STUBS, paths=("a.py", "../tree/a.py"))
